@@ -42,7 +42,7 @@ describe('Router', function () {
 
     describe('#reduce()', function () {
 
-        it('should work', function () {
+        it('should work', async function () {
             const router = new Router();
 
             const route = sinon.spy();
@@ -53,13 +53,13 @@ describe('Router', function () {
             router.use('/first', noRoute);
             router.use('/*', route);
 
-            router.reduce(req, res);
+            await router.reduce(req, res);
 
             assert(!noRoute.called, 'route should not be called');
             shouldBeCalled(route, req, res);
         });
 
-        it('should call matching url', function () {
+        it('should call matching url', async function () {
             const router = new Router();
 
             const route = sinon.spy();
@@ -70,14 +70,14 @@ describe('Router', function () {
             router.use('action', route);
             router.use('*', noRoute);
 
-            router.reduce(req, res);
+            await router.reduce(req, res);
 
             assert(!noRoute.called, 'route should not be called');
             shouldBeCalled(route, req, res);
 
         });
 
-        it('should call matching text with regexp', function () {
+        it('should call matching text with regexp', async function () {
             const router = new Router();
 
             const route = sinon.spy();
@@ -88,31 +88,44 @@ describe('Router', function () {
             router.use('action', /^just\sa\stext$/, route);
             router.use('*', noRoute);
 
-            router.reduce(req, res);
+            await router.reduce(req, res);
 
             assert(!noRoute.called, 'route should not be called');
             shouldBeCalled(route, req, res);
 
         });
 
-        it('should pass request to next routes', function () {
+        it('should pass request to next routes', async function () {
             const router = new Router();
+
+            let i = 0;
 
             const first = sinon.spy((req, res, postBack, next) => next());
             const second = sinon.spy((req, res, postBack, next) => next());
-            const third = sinon.spy((req, res, postBack, next) => next());
-            const fourth = sinon.spy((req, res, postBack, next) => next());
-            const resolverCallback = sinon.spy(() => true);
+            const resolver = sinon.spy(() => new Promise(resolve => setTimeout(resolve, 50))
+                .then(() => i++)
+                .then(() => true)
+            );
+            const third = sinon.spy((req, res, postBack, next) => {
+                assert.equal(i, 1, 'The third reducer should be called after async resolver was resolved.');
+                return new Promise(resolve => setTimeout(resolve, 50))
+                    .then(() => i++)
+                    .then(() => next());
+            });
+            const fourth = sinon.spy((req, res, postBack, next) => {
+                assert.equal(i, 2, 'The fourth reducer should be called after the third async reducer was resolved.');
+                next();
+            });
             const last = sinon.spy();
             const req = createMockReq('just a text', null);
             const res = createMockRes();
 
             router.use('fakin-action', /^just\sa\stext$/, first);
             router.use('anotheraction', 'just a text', second);
-            router.use('anotheraction', resolverCallback, third, fourth);
+            router.use('anotheraction', resolver, third, fourth);
             router.use('*', last);
 
-            router.reduce(req, res);
+            await router.reduce(req, res);
 
             shouldBeCalled(first, req, res);
             shouldBeCalled(second, req, res);
@@ -120,9 +133,10 @@ describe('Router', function () {
             shouldBeCalled(fourth, req, res);
             shouldBeCalled(last, req, res);
 
-            assert(resolverCallback.called);
-            assert.strictEqual(resolverCallback.firstCall.args[0], req);
+            // assert.equal(resolver.callCount, 1, 'The resolver should be called once');
+            assert.strictEqual(resolver.firstCall.args[0], req);
 
+            resolver.calledBefore(first);
             first.calledBefore(second);
             first.calledBefore(third);
             first.calledBefore(fourth);
@@ -138,7 +152,7 @@ describe('Router', function () {
     });
 
     describe('#use()', function () {
-        it('should accept a router as parameter', function () {
+        it('should accept a router as parameter', async function () {
             const route = sinon.spy();
             const noRoute = sinon.spy();
             const req = createMockReq('', '/nested/inner');
@@ -152,13 +166,13 @@ describe('Router', function () {
             router.use('/nested', nestedRouter);
             router.use('/', noRoute);
 
-            router.reduce(req, res);
+            await await router.reduce(req, res);
 
             assert(!noRoute.called, 'route should not be called');
             shouldBeCalled(route, req, res);
         });
 
-        it('should allow to set exit actions', function () {
+        it('should allow to set exit actions', async function () {
             const route = sinon.spy((req, res, postBack, next) => next('exit'));
             const noRoute = sinon.spy();
             const globalNext = sinon.spy();
@@ -181,7 +195,7 @@ describe('Router', function () {
             router.use('/nested', nestedRouter);
             router.use('/', noRoute);
 
-            router.reduce(req, res, () => {}, globalNext);
+            await router.reduce(req, res, () => {}, globalNext);
 
             // assert routes
             assert(!noRoute.called, 'route should not be called');
@@ -195,7 +209,7 @@ describe('Router', function () {
             assert(globalNext.called);
         });
 
-        it('should pass expected actions to nested routers', function () {
+        it('should pass expected actions to nested routers', async function () {
             const route = sinon.spy((req, res, postBack, next) => next());
             const noRoute = sinon.spy();
             const finalRoute = sinon.spy();
@@ -221,7 +235,7 @@ describe('Router', function () {
 
             router.on('action', actionSpy);
 
-            router.reduce(req, res, globalNext);
+            await router.reduce(req, res, globalNext);
 
             // assert routes
             assert(!noRoute.called, 'route should not be called');
@@ -244,7 +258,7 @@ describe('Router', function () {
                 });
         });
 
-        it('should execute wildcard actions when the pattern is matching', function () {
+        it('should execute wildcard actions when the pattern is matching', async function () {
             const router = new Router();
 
             const route = sinon.spy();
@@ -256,13 +270,13 @@ describe('Router', function () {
             router.use(/^action\swith\stext$/, route);
             router.use(noRoute);
 
-            router.reduce(req, res);
+            await router.reduce(req, res);
 
             shouldBeCalled(route, req, res);
             assert(!noRoute.called, 'route should not be called');
         });
 
-        it('should make relative paths absolute and call postBack methods', function () {
+        it('should make relative paths absolute and call postBack methods', async function () {
             const router = new Router();
 
             const route = sinon.spy((req, res, postBack) => postBack('relative', { data: 1 }));
@@ -274,7 +288,7 @@ describe('Router', function () {
             router.use(route);
             router.use('*', noRoute);
 
-            router.reduce(req, res, postBack, undefined, '/prefix');
+            await router.reduce(req, res, postBack, undefined, '/prefix');
 
             assert(!noRoute.called, 'route should not be called');
             shouldBeCalled(route, req, res);
@@ -282,7 +296,7 @@ describe('Router', function () {
             assert.deepEqual(postBack.firstCall.args, ['/prefix/relative', { data: 1 }]);
         });
 
-        it('should make relative paths absolute and call wait postBack methods', function () {
+        it('should make relative paths absolute and call wait postBack methods', async function () {
             const router = new Router();
 
             const route = sinon.spy((req, res, postBack) => {
@@ -302,7 +316,7 @@ describe('Router', function () {
             router.use(route);
             router.use('*', noRoute);
 
-            router.reduce(req, res, postBack, undefined, '/prefix');
+            await router.reduce(req, res, postBack, undefined, '/prefix');
 
             assert(!noRoute.called, 'route should not be called');
             shouldBeCalled(route, req, res);

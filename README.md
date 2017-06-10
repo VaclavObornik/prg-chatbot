@@ -7,7 +7,7 @@ Framework for building reusable chatbot components. **Routing**, **Keyword recog
 ## Requirements and installation
 
   - requires `mongoose` > 4.0
-  - requires `nodejs` > 6.0
+  - requires `nodejs` >= 8.0
   - requires `express` > 4.0
   - requires `body-parser` > 1.10
 

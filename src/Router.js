@@ -52,14 +52,14 @@ class Router extends ReducerWrapper {
      * Appends middleware, action handler or another router
      *
      * @param {string} [action] name of the action
-     * @param {RegExp|string|function} [pattern]
+     * @param {RegExp|string|function} [matcher] - The function can be async
      * @param {...(function|Router)} reducers
      * @returns {{next:function}}
      *
      * @example
      * // middleware
      * router.use((req, res, postBack, next) => {
-     *     next(); // strictly synchronous
+     *     next();
      * });
      *
      * // route with matching regexp
@@ -68,7 +68,7 @@ class Router extends ReducerWrapper {
      * });
      *
      * // route with matching function (the function is considered as matcher
-     * // in case of the function accepts zero or one arguments)
+     * // in case of the function accepts zero or one argument)
      * router.use('action', req => req.text() === 'a', (req, res) => {
      *     res.text('Hello!');
      * });
@@ -90,6 +90,7 @@ class Router extends ReducerWrapper {
     use (...reducers) {
 
         let path = typeof reducers[0] === 'string' ? reducers.shift() : '*';
+        path = this._normalizePath(path);
 
         // matcher can be only if there is another reduce function
         const match = (reducers.length >= 2 && this._isMatcher(reducers[0]))
@@ -98,31 +99,32 @@ class Router extends ReducerWrapper {
 
         const nexts = [];
 
-        for (let reduce of reducers) {
+        this._routes.push({
+            path,
+            match,
+            nexts,
+            reducers: reducers.map((reducer) => {
 
-            let isReducer = false;
+                let isReducer = false;
+                let reduce = reducer;
 
-            if (typeof reduce === 'object' && reduce.reduce) {
-                isReducer = true;
+                if (typeof reduce === 'object' && reduce.reduce) {
+                    isReducer = true;
 
-                reduce.on('action', (...args) => this.emit('action', ...args));
-                reduce.on('_action', (...args) => this.emit('_action', ...args));
+                    reduce.on('action', (...args) => this.emit('action', ...args));
+                    reduce.on('_action', (...args) => this.emit('_action', ...args));
 
-                const reducerFn = reduce.reduce.bind(reduce);
-                reduce = (...args) => reducerFn(...args);
-            }
+                    const reduceFn = reduce.reduce.bind(reduce);
+                    reduce = (...args) => reduceFn(...args);
+                }
 
-            path = this._normalizePath(path);
-
-            this._routes.push({
-                path,
-                pathMatch: pathToRegexp(path, [], { end: !isReducer }),
-                match,
-                reduce,
-                nexts,
-                isReducer
-            });
-        }
+                return {
+                    pathMatch: pathToRegexp(path, [], { end: !isReducer }),
+                    reduce,
+                    isReducer
+                };
+            })
+        });
 
         return {
             next (actionName, listener) {
@@ -190,42 +192,55 @@ class Router extends ReducerWrapper {
         return postBack;
     }
 
-    reduce (req, res, postBack = () => {}, next = () => {}, path = '/') {
+    async reduce (req, res, postBack = () => {}, next = () => {}, path = '/') {
         const action = this._action(req, path);
         const relativePostBack = this._makePostBackRelative(postBack, path);
-        const found = this._routes.some((route) => {
-            if (this._routeMatch(route, action, req)) {
+
+        let found = false;
+
+        routesLoop:
+        for (const route of this._routes) {
+            const matchingRouteReducers = await this._filterMatchingReducers(route, action, req);
+
+            for (const reducer of matchingRouteReducers) {
                 let pathContext = `${path === '/' ? '' : path}${route.path.replace(/\/\*/, '')}`;
                 res.setPath(path);
                 const nextContext = this._createNext(route, req, res, relativePostBack, path);
-                route.reduce(req, res, relativePostBack, nextContext, pathContext);
+                await reducer.reduce(req, res, relativePostBack, nextContext, pathContext);
 
-                if (!route.isReducer) {
+                if (!reducer.isReducer) {
                     pathContext = `${path === '/' ? '' : path}${route.path}`;
                     this._emitAction(req, pathContext);
                 }
 
                 if (!nextContext.called) {
-                    return true;
+                    found = true;
+                    break routesLoop;
                 } else if (nextContext.action) {
-                    next(nextContext.action, nextContext.data);
-                    return true;
+                    await next(nextContext.action, nextContext.data);
+                    found = true;
+                    break routesLoop;
                 }
             }
-            return false;
-        });
+        }
+
         if (!found) {
-            next();
+            await next();
         }
     }
 
-    _routeMatch (route, action, req) {
-        if (action && route.path !== '/*') {
-            return route.pathMatch.exec(action);
-        } else if (route.match === null) {
-            return route.pathMatch.exec('/');
+    async _filterMatchingReducers (route, action, req) {
+
+        // we want to call route.match only once in case of multiple reducers
+        if ((!action || route.path === '/*') && route.match !== null) {
+            return await route.match(req) ? route.reducers : [];
         }
-        return route.match(req);
+
+        if (action && route.path !== '/*') {
+            return route.reducers.filter(reducer => reducer.pathMatch.exec(action));
+        }
+
+        return route.reducers.filter(reducer => reducer.pathMatch.exec('/'));
     }
 
     _action (req, path) {
