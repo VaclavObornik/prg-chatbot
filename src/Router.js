@@ -6,6 +6,7 @@
 const ReducerWrapper = require('./ReducerWrapper');
 const { makeAbsolute } = require('./pathUtils');
 const pathToRegexp = require('path-to-regexp');
+const co = require('co');
 
 /**
  * Cascading router
@@ -33,21 +34,6 @@ class Router extends ReducerWrapper {
         return normalizedPath.replace(/\/$/, '');
     }
 
-    _isMatcher (value) {
-        const type = typeof value;
-        return type === 'string' || value instanceof RegExp ||
-            (type === 'function' && value.length <= 1);
-    }
-
-    _makeMatchCallback (pattern) {
-        if (pattern instanceof RegExp || typeof pattern === 'string') {
-            // @todo webalized pattern
-            return req => req.text(true).match(pattern);
-        }
-
-        return pattern;
-    }
-
     /**
      * Appends middleware, action handler or another router
      *
@@ -58,9 +44,7 @@ class Router extends ReducerWrapper {
      *
      * @example
      * // middleware
-     * router.use((req, res, postBack, next) => {
-     *     next();
-     * });
+     * router.use((req, res, postBack) => Router.CONTINUE);
      *
      * // route with matching regexp
      * router.use('action', /help/, (req, res) => {
@@ -92,23 +76,22 @@ class Router extends ReducerWrapper {
         let path = typeof reducers[0] === 'string' ? reducers.shift() : '*';
         path = this._normalizePath(path);
 
-        // matcher can be only if there is another reduce function
-        const match = (reducers.length >= 2 && this._isMatcher(reducers[0]))
-            ? this._makeMatchCallback(reducers.shift())
-            : null;
-
-        const nexts = [];
+        const exitPoints = new Map();
 
         this._routes.push({
             path,
-            match,
-            nexts,
+            pathMatch: pathToRegexp(path, [], { end: path === '' }),
+            exitPoints,
             reducers: reducers.map((reducer) => {
 
                 let isReducer = false;
                 let reduce = reducer;
 
-                if (typeof reduce === 'object' && reduce.reduce) {
+                if (reducer instanceof RegExp || typeof reducer === 'string') {
+                    reduce = req =>
+                        (req.text(true).match(reducer) ? Router.CONTINUE : Router.BREAK);
+
+                } else if (typeof reduce === 'object' && reduce.reduce) {
                     isReducer = true;
 
                     reduce.on('action', (...args) => this.emit('action', ...args));
@@ -119,7 +102,6 @@ class Router extends ReducerWrapper {
                 }
 
                 return {
-                    pathMatch: pathToRegexp(path, [], { end: !isReducer }),
                     reduce,
                     isReducer
                 };
@@ -128,53 +110,27 @@ class Router extends ReducerWrapper {
 
         return {
             next (actionName, listener) {
-                nexts.push({
-                    action: actionName,
-                    listener,
-                    pathMatch: pathToRegexp(path)
-                });
+                exitPoints.set(actionName, listener);
                 return this;
             }
         };
     }
 
-    _createNext (route, req, res, postBack, path) {
-        const next = (action = null, data = {}) => {
-            let finnished = false;
-            res.setPath(path);
-            if (route.nexts) {
-                finnished = route.nexts.some((nextAction) => {
-                    if (nextAction.action === action || nextAction.action === '*') {
-                        const nextContext = this._createNext({}, req, res);
-                        nextAction.listener(data, req, res, postBack, nextContext);
+    * _callExitPoint (route, req, res, postBack, path, exitPointName, data = {}) {
 
-                        if (!nextContext.called) {
-                            return true;
-                        } else if (nextContext.action) {
-                            next.action = nextContext.action;
-                            next.data = nextContext.data;
-                            next.called = true;
-                            return true;
-                        }
-                    }
-                    return false;
-                });
-            }
+        res.setPath(path);
 
-            if (!finnished && action) {
-                next.action = action;
-                next.data = data;
-            }
-            if (!next.called) {
-                next.called = !finnished;
-            }
-        };
+        if (!route.exitPoints.has(exitPointName)) {
+            return [exitPointName, data];
+        }
 
-        next.action = null;
-        next.data = {};
-        next.called = false;
+        const result = route.exitPoints.get(exitPointName)(data, req, res, postBack);
 
-        return next;
+        if (typeof result === 'string' || Array.isArray(result)) {
+            return result;
+        }
+
+        return Router.END;
     }
 
     _relativePostBack (origPostBack, path) {
@@ -192,55 +148,51 @@ class Router extends ReducerWrapper {
         return postBack;
     }
 
-    async reduce (req, res, postBack = () => {}, next = () => {}, path = '/') {
-        const action = this._action(req, path);
-        const relativePostBack = this._makePostBackRelative(postBack, path);
+    reduce (req, res, postBack = () => {}, path = '/') {
+        return co(function* () {
+            const action = this._action(req, path);
+            const relativePostBack = this._makePostBackRelative(postBack, path);
 
-        let found = false;
+            for (const route of this._routes) {
 
-        routesLoop:
-        for (const route of this._routes) {
-            const matchingRouteReducers = await this._filterMatchingReducers(route, action, req);
-
-            for (const reducer of matchingRouteReducers) {
-                let pathContext = `${path === '/' ? '' : path}${route.path.replace(/\/\*/, '')}`;
-                res.setPath(path);
-                const nextContext = this._createNext(route, req, res, relativePostBack, path);
-                await reducer.reduce(req, res, relativePostBack, nextContext, pathContext);
-
-                if (!reducer.isReducer) {
-                    pathContext = `${path === '/' ? '' : path}${route.path}`;
-                    this._emitAction(req, pathContext);
+                if (action && route.path !== '/*' && !route.pathMatch.exec(action)) {
+                    continue;
                 }
 
-                if (!nextContext.called) {
-                    found = true;
-                    break routesLoop;
-                } else if (nextContext.action) {
-                    await next(nextContext.action, nextContext.data);
-                    found = true;
-                    break routesLoop;
+                for (const reducer of route.reducers) {
+                    let pathContext = `${path === '/' ? '' : path}${route.path.replace(/\/\*/, '')}`;
+                    res.setPath(path);
+
+                    let result = reducer.reduce(req, res, relativePostBack, pathContext);
+                    if (result instanceof Promise) {
+                        result = yield result;
+                    }
+
+                    if (!reducer.isReducer) {
+                        pathContext = `${path === '/' ? '' : path}${route.path}`;
+                        this._emitAction(req, pathContext);
+                    }
+
+                    if (result === Router.BREAK) {
+                        break; // skip the rest path reducers, continue with next route
+
+                    } else if (typeof result === 'string' || Array.isArray(result)) {
+                        const [exitPoint, data] = Array.isArray(result) ? result : [result];
+
+                        // NOTE exit point can cause call of an upper exit point
+                        return yield* this._callExitPoint(
+                            route, req, res, relativePostBack, path, exitPoint, data
+                        );
+
+                    } else if (result !== Router.CONTINUE) {
+                        return Router.END;
+                    }
                 }
             }
-        }
 
-        if (!found) {
-            await next();
-        }
-    }
+            return Router.CONTINUE;
 
-    async _filterMatchingReducers (route, action, req) {
-
-        // we want to call route.match only once in case of multiple reducers
-        if ((!action || route.path === '/*') && route.match !== null) {
-            return await route.match(req) ? route.reducers : [];
-        }
-
-        if (action && route.path !== '/*') {
-            return route.reducers.filter(reducer => reducer.pathMatch.exec(action));
-        }
-
-        return route.reducers.filter(reducer => reducer.pathMatch.exec('/'));
+        }.bind(this));
     }
 
     _action (req, path) {
@@ -264,5 +216,9 @@ class Router extends ReducerWrapper {
         return null;
     }
 }
+
+Router.CONTINUE = true;
+Router.BREAK = false;
+Router.END = null;
 
 module.exports = Router;

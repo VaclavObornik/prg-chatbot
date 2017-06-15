@@ -3,6 +3,7 @@
  */
 'use strict';
 
+const co = require('co');
 const UserLoader = require('./UserLoader');
 const Responder = require('./Responder');
 const Request = require('./Request');
@@ -231,7 +232,7 @@ class Processor {
                 return this.stateStorage.onAfterStateLoad(req, stateObject);
             })
             .then(stateObject => this._getOrCreateToken(isRef, senderId, stateObject))
-            .then(async ({ token, stateObject }) => {
+            .then(co.wrap(function* ({ token, stateObject }) {
 
                 // update the state of request
                 state = stateObject.state;
@@ -246,10 +247,14 @@ class Processor {
 
                 const postBack = this._createPostBack(senderId, pageId, postbacks, senderFn, wait);
 
+                let reduceResult;
                 if (typeof this.reducer === 'function') {
-                    await this.reducer(req, res, postBack);
+                    reduceResult = this.reducer(req, res, postBack);
                 } else {
-                    await this.reducer.reduce(req, res, postBack);
+                    reduceResult = this.reducer.reduce(req, res, postBack);
+                }
+                if (reduceResult instanceof Promise) { // note the result can be undefined
+                    yield reduceResult;
                 }
 
                 state = Object.assign({}, state, res.newState);
@@ -275,7 +280,7 @@ class Processor {
 
                 return refHandler.getPromise()
                     .then(recipientId => this._loadState(false, recipientId));
-            })
+            }.bind(this)))
             .then((stateObject) => {
                 if (!stateObject) {
                     return null;
